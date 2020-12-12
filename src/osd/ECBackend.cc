@@ -14,6 +14,7 @@
 
 #include <iostream>
 #include <sstream>
+#include <string>
 
 #include "ECBackend.h"
 #include "messages/MOSDPGPush.h"
@@ -195,12 +196,10 @@ ECBackend::ECBackend(
   ObjectStore *store,
   CephContext *cct,
   ErasureCodeInterfaceRef ec_impl,
-  uint64_t stripe_width,
-  OSDService *o)
+  uint64_t stripe_width)
   : PGBackend(cct, pg, store, coll, ch),
     ec_impl(ec_impl),
-    sinfo(ec_impl->get_data_chunk_count(), stripe_width),
-    osd(o) {
+    sinfo(ec_impl->get_data_chunk_count(), stripe_width) {
   assert((ec_impl->get_data_chunk_count() *
 	  ec_impl->get_chunk_size(stripe_width)) == stripe_width);
 }
@@ -763,8 +762,6 @@ bool ECBackend::_handle_message(
     // NOTE: this is non-const because handle_sub_write modifies the embedded
     // ObjectStore::Transaction in place (and then std::move's it).  It does
     // not conflict with ECSubWrite's operator<<.
-    osd->osd->pending_sub_write_num--;
-    osd->osd->get_logger()->set(l_osd_pending_sub_write_num,osd->osd->pending_sub_write_num);
     MOSDECSubOpWrite *op = static_cast<MOSDECSubOpWrite*>(
       _op->get_nonconst_req());
     parent->maybe_preempt_replica_scrub(op->op.soid);
@@ -778,28 +775,16 @@ bool ECBackend::_handle_message(
     return true;
   }
   case MSG_OSD_EC_READ: {
-
-    osd->osd->pending_sub_read_num--;
-    osd->osd->get_logger()->set(l_osd_pending_sub_read_num,osd->osd->pending_sub_read_num);
-    dout(0)<<" mydebug:pending_info#"<<ceph_clock_now()<<","<<osd->osd->pending_sub_read_num<<"#"<<dendl;
-
     const MOSDECSubOpRead *op = static_cast<const MOSDECSubOpRead*>(_op->get_req());
     MOSDECSubOpReadReply *reply = new MOSDECSubOpReadReply;
     reply->pgid = get_parent()->primary_spg_t();
     reply->map_epoch = get_parent()->get_epoch();
     reply->min_epoch = get_parent()->get_interval_start_epoch();
-
-    reply->op.wait_for_service_time = ceph_clock_now() - _op->get_req()->get_recv_stamp(); 
-		//reply->op.queue_size = _op->get_queue_size_when_enqueued();
-		reply->op.send_time = op->op.send_time;
-    reply->op.queue_size = _op->read_queue_size;
-    reply->op.queue_size_write = _op->write_queue_size;
-
     handle_sub_read(op->op.from, op->op, &(reply->op), _op->pg_trace);
     reply->trace = _op->pg_trace;
     get_parent()->send_message_osd_cluster(
       op->op.from.osd, reply, get_parent()->get_epoch());
-    dout(0) << " mydebug:sub_read_op_finish" << "##" << dendl;
+    dout(0) << " mydebug::" << "#"<<op->op.to_read.begin()->first.oid.name<<",sub_read_op_finish," << ceph_clock_now()<<"#" << dendl;
     return true;
   }
   case MSG_OSD_EC_READ_REPLY: {
@@ -807,12 +792,6 @@ bool ECBackend::_handle_message(
     // buffers.  It does not conflict with ECSubReadReply operator<<.
     MOSDECSubOpReadReply *op = static_cast<MOSDECSubOpReadReply*>(
       _op->get_nonconst_req());
-
-    const Message* m = _op->get_req();
-    utime_t p_time =  m->get_recv_stamp() - op->op.send_time;
-    dout(0)<<":sub_info#"<< op->op.buffers_read.begin()->first.oid.name<<","<< op->op.from.osd<<","<<p_time<<","<<op->op.disk_read_time<<","<<op->op.queue_size<<","<<op->op.wait_for_service_time<<","<<op->op.queue_size_write<<"#"<<dendl;
-    //对象名称，来自哪个osd，总的latency，磁盘时间，到达时读队列的大小，服务等待时间，到达时写队列的大小
-    //<<","<<queue_size<<","<<wait_for_service_time<<","<<disk_read_time<<
     RecoveryMessages rm;
     handle_sub_read_reply(op->op.from, op->op, &rm, _op->pg_trace);
     dispatch_recovery_messages(rm, priority);
@@ -1008,10 +987,7 @@ void ECBackend::handle_sub_write(
   tls.reserve(2);
   tls.push_back(std::move(op.t));
   tls.push_back(std::move(localt));
-
-  //utime_t start_write_time = ceph_clock_now();
   get_parent()->queue_transactions(tls, msg);
-  //dout(0) << "mydebug: write latency:" << ceph_clock_now()-start_write_time << dendl;
 }
 
 void ECBackend::handle_sub_read(
@@ -1022,37 +998,18 @@ void ECBackend::handle_sub_read(
 {
   trace.event("handle sub read");
   shard_id_t shard = get_parent()->whoami_shard().shard;
-  for(auto i = op.to_read.begin();  //to_read 是一个map，保存了每个object需要读取的偏移列表
+  for(auto i = op.to_read.begin();
       i != op.to_read.end();
       ++i) {
     int r = 0;
     for (auto j = i->second.begin(); j != i->second.end(); ++j) {
       bufferlist bl;
-      utime_t start_read_time;
-			utime_t end_read_time;
-			start_read_time = ceph_clock_now();
       r = store->read(
 	ch,
 	ghobject_t(i->first, ghobject_t::NO_GEN, shard),
 	j->get<0>(),
 	j->get<1>(),
 	bl, j->get<2>());
-      //for balance generator
-      utime_t delay_interval;
-			delay_interval.tv.tv_sec = 0;
-      //delay_interval.tv.tv_nsec = 40000000;
-			delay_interval.tv.tv_nsec = osd->basic_delay_time * osd->delay_factor;
-			utime_t delay_start_time = ceph_clock_now(); 
-			while(ceph_clock_now() - delay_start_time < delay_interval); 
-			utime_t delay_end_time = ceph_clock_now();
-      osd->osd->disk_average_queue.add_value((delay_end_time - start_read_time).to_nsec());
-      dout(0)<< ": mydebug: add_value:"<<(delay_end_time - start_read_time).to_nsec()<<dendl;
-      osd->osd->get_logger()->set(l_osd_disk_read_latency,osd->osd->disk_average_queue.get_mean());
-      dout(0)<< ": mydebug: set_value:"<<osd->osd->disk_average_queue.get_mean()<<dendl;
-      //dout(0)<< ": mydebug: basic_delay_time="<<osd->basic_delay_time <<dendl;
-      //dout(0)<< ": mydebug: delay_factor="<<osd->delay_factor <<dendl;
-      //dout(0)<< ": mydebug: disk_read_time="<<delay_end_time - start_read_time <<dendl;
-
       if (r < 0) {
 	get_parent()->clog_error() << "Error " << r
 				   << " reading object "
@@ -1061,10 +1018,6 @@ void ECBackend::handle_sub_read(
 		<< " reading " << i->first << dendl;
 	goto error;
       } else {
-        end_read_time = ceph_clock_now();
-        reply->disk_read_time = end_read_time -start_read_time;
-        dout(0)<< ": mydebug: read latency:"<<end_read_time - start_read_time <<dendl;
-
         dout(20) << __func__ << " read request=" << j->get<1>() << " r=" << r << " len=" << bl.length() << dendl;
 	reply->buffers_read[i->first].push_back(
 	  make_pair(
@@ -1305,7 +1258,6 @@ void ECBackend::handle_sub_read_reply(
   if (rop.in_progress.empty() || is_complete == rop.complete.size()) {
     dout(20) << __func__ << " Complete: " << rop << dendl;
     rop.trace.event("ec read complete");
-    //dout(0)<<" :obj_end#"<<op.buffers_read.begin()->first.oid.name<<","<<ceph_clock_now()<<","<<osd->whoami<<"#"<<dendl;
     complete_read_op(rop, m);
   } else {
     dout(10) << __func__ << " readop not complete: " << rop << dendl;
@@ -1609,45 +1561,6 @@ void ECBackend::get_all_avail_shards(
   }
 }
 
-bool mycmp(pair<shard_id_t,int> a, pair<shard_id_t,int> b) {
-	return a.second > b.second; //降序排列，延迟大的osd放前面
-}
-
-bool mycmp3(pair<int,int> a, pair<int,int> b) {
-	return a.second > b.second; //降序排列，延迟大的osd放前面
-}
-
-bool mycmp2(pair<int,float> a, pair<int,float> b) {
-	return a.second < b.second; //升序排列，延迟小的osd放前面
-}
-
-void havetostr(string& res, int* have)
-{
-    for(int i=0;i<(EC_K+EC_M);i++){
-        if(i!=(EC_K+EC_M-1)){
-            string temp = to_string(have[i])+string(",");
-            res += temp;
-        }else{
-            string temp = to_string(have[i]);
-            res += temp;
-        }
-    }
-    //cout<<"have to str:"<<res<<endl;
-}
-
-void strtohave(string& res, int* have)
-{
-    int pos = res.find(",");
-    int pre_pos = 0;
-    int i=0;
-    while(i<(EC_K+EC_M)){
-        have[i] = stoi(res.substr(pre_pos,(pos-pre_pos)));
-        i++;
-        pre_pos = pos+1;
-        pos = res.find(",",pre_pos);
-    }
-}
-
 int ECBackend::get_min_avail_to_read_shards(
   const hobject_t &hoid,
   const set<int> &want,
@@ -1663,543 +1576,134 @@ int ECBackend::get_min_avail_to_read_shards(
   set<pg_shard_t> error_shards;
 
   get_all_avail_shards(hoid, error_shards, have, shards, for_recovery);
-  string before_str="";
-  string after_str="";
-  for(map<shard_id_t, pg_shard_t>::iterator i = shards.begin();i != shards.end();++i){
-    before_str+=to_string(i->second.osd);
+  //获取redis_context服务器
+  redisReply* reply;
+  vector<redisContext *> context; 
+  for(set<pg_shard_t>::iterator i = to_read->begin();i!=to_read->end();i++){
+    context.push_back(i->osd->redis_context);
+    //dout(0)<<":sub_info#estimated,"<< hoid.oid.name<<","<<i->osd<<","<<queue_map[i->osd]<<"#"<<dendl;
   }
-  
-  //dout(0) << ": mydebug: schedule_info#before,"<< hoid.oid.name << "," <<before_str<<"#"<< dendl;
-  dout(0)<<" mydebug:schedule_info#"<<ceph_clock_now()<<","<<before_str<<"#"<<dendl;
-  //straggler = 6 & 7
-  // if(osd->cct->_conf->osd_imbalance_pattern != 0){
-  //   for (map<shard_id_t, pg_shard_t>::iterator i = shards.begin();
-  //     i != shards.end();
-  //     ++i)
-  //   {
-  //     if((i->second).osd == 6 || (i->second).osd == 7){
-  //       dout(0) << ": mydebug: shards "<< i->first <<" have straggler osd "<<(i->second).osd << dendl;
-  //       have.erase(i->first);
-  //       dout(0) << ": mydebug: erase " << i->first << " from have" << dendl;
-  //     }	
-  //   }
-  // }else{
-  //   int *load_map = [0,1,2,3,4,5,6,7];
-  //   vector<pair<shard_id_t,int>> load_of_shard;
-  //   for (map<shard_id_t, pg_shard_t>::iterator i = shards.begin();
-  //     i != shards.end();
-  //     ++i)
-  //   {
-  //     load_of_shard.push_back(make_pair(i->first, load_map[i->second.osd]));
-  //   }
-  //   sort(load_of_shard.begin(),load_of_shard.end(),mycmp);
-  //   have.erase(load_of_shard[0].first);
-  //   have.erase(load_of_shard[1].first);
-  // }
-  /****k-optimal***/
-  vector<float> queue_map(NUM_OSD);
 
-  if(osd->k_optimal){
-    //vector<int> queue_map(NUM_OSD);
-    int queue_map_size = 0;
-    osd->osd->schedule_lock.lock();
-    for(auto it : osd->osd->pending_list_size_map){ //for primitive k-optimal
-      int cur_osd = it.first;
-      int cur_size = it.second;
-      queue_map[cur_osd] = cur_size;//+queue_map_size/8 fff
-      queue_map_size++;
-    }
-    // if(osd->gio_reset==1){ //latest k-optimal
-    //     for(int i=0;i<NUM_OSD;i++){
-    //       osd->accumulate_queue_map[i] = 0;
-    //     }
-    //     osd->gio_reset=0;
-    //     dout(0)<<" mydebug: reset gio complete"<<dendl;
-    // }
-    // for(int i=0;i<NUM_OSD;i++){
-    //   //osd->accumulate_queue_map[i]=0;
-    //   queue_map[i] = osd->accumulate_queue_map[i];
-    //   queue_map_size++;
-    // }
-    osd->osd->schedule_lock.unlock();
-    if(queue_map_size<NUM_OSD){
-      dout(0)<<" mydebug: did not get complete queue_map"<<dendl;
-    }
-    //int load_map[] = {0,1,2,3,4,5,6,7};//primitive k-optimal
-    vector<pair<shard_id_t,int>> load_of_shard;
-    vector<pair<int,int>> load_of_shard2;
-    for (map<shard_id_t, pg_shard_t>::iterator i = shards.begin();
-      i != shards.end();
-      ++i)
-    {
-      load_of_shard.push_back(make_pair(i->first, queue_map[i->second.osd]));
-      load_of_shard2.push_back(make_pair(i->second.osd, queue_map[i->second.osd]));
-    }
-    sort(load_of_shard.begin(),load_of_shard.end(),mycmp);
-    sort(load_of_shard2.begin(),load_of_shard2.end(),mycmp3);
-    have.erase(load_of_shard[0].first);
-    have.erase(load_of_shard[1].first);
-    // for(int i=2;i<(EC_K+EC_M);i++){//latest k-optimal
-    //   osd->accumulate_queue_map[load_of_shard2[i].first]++;
-    // }
-    // int queue_sum=0;
-    // for(int i=0;i<NUM_OSD;i++){
-    //   queue_sum+=osd->accumulate_queue_map[i];
-    //   dout(0)<<"mydebug:queue_info#"<<queue_sum<<"#"<<dendl;
-    // }
+  //communicator:先publish，再监听，在coordination_window之内
+  havetostr(Layout, have);
+  map<int, vector<int>> Peer_List;//这个地方要考虑一下，要使得map是先进先出的
+	vector<int> Send_List;//和PeerList差不多，记录发往哪几个
+	map<int, vector<int>> Res_List; //{1, {1,2,3,4}}
+  //先将自己加入Peer_List
+  int my_id = get_parent()->whoami();
+	Peer_List[my_id] = have;
+	vector<int> Pub_List;//用来记录自己发往了哪几个
+	bool published = false;//记录是否进行过publish
+	int left_time = WS; //初始化剩余时间coordination_window_size
+	cout << "finish initialize" << endl;
+	cout << "------coordination_window starts------" << endl;
+  while (1) {
+			if (left_time == 0) {//如果一进来就是0的话，说明没有启动FSpinner
+				cout << "FSpinner is disabled" << endl;
+				break;
+			}
+			//publish:对其他的redisserver上的comm_queue做rpush操作
+			if (published == false) {//还没publish过
+				int pub_begin = 0, pub_end = 0;//publish的开始和结束时间 
+				pub_begin = ceph_clock_now();
+				//每个object request 将自己的layout公开出去
+				string Win_Info = to_string(my_id) + " " + Layout + " " + to_string(pub_begin);
+				cout << "Win_Info=" << Win_Info << endl;
+				publish(my_id, reply, contexts, Pub_List, Win_Info);
+				published = true;//只publish一次
+				pub_end = ceph_clock_now();
+				left_time -= pub_end - pub_begin;
+				cout << "publish finish, left time=" << left_time << "(usec)" << endl;
+				if (left_time <= 0) {
+					cout << "coordination window ends after publish" << endl;//publish已经用掉了所有时间
+					reply = (redisReply*)redisCommand(contexts[my_id], "del %s", "comm_queue");//删除comm_queue，不再接受新的pub
+					break;
+				}
+			}
 
-  }else if(osd->gio){//gio
-    int my_id = get_parent()->whoami();
-    string info_key = string("info")+to_string(my_id);
-    string num_key = string("num")+to_string(my_id);
-    string time_key = string("time")+to_string(my_id); //this is usec
-    string sec_key = string("sec")+to_string(my_id);
+			//subscribe:对自己的redisserver上的comm_queue做lpop操作
+			//每次lpop一个，如果到时间了，就把剩下的都搞完
+			int sub_begin = 0, sub_end = 0;// subscribe阶段的开始和结束
+			sub_begin = ceph_clock_now();
+			sub_once(my_id, reply, contexts, "comm_queue", Peer_List, Send_List);
+			sub_end = ceph_clock_now();
+			left_time -= sub_end - sub_begin;
+			if (left_time <= 0) {
+				cout << "coordination window ends after subscribe" << endl;//subscribe已经用掉了所有时间
+				reply = (redisReply*)redisCommand(contexts[my_id], "rename %s %s", "comm_queue", "comm_queue2");//更改comm_queue名称，使其他OSD无法访问
+				//处理comm_queue2中剩余的元素
+				for (;;) {
+					if (sub_once(my_id, reply, contexts, "comm_queue2", Peer_List, Send_List) == false) {
+						reply = (redisReply*)redisCommand(contexts[my_id], "del %s", "comm_queue2");//删除comm_queue，不再接受新的pub
+						break;
+					}
+				}
+				break;
+			}
+	}
+	cout << "------coordination_window ends ------" << endl;
+  cout << "...Peer List..." << endl;
+		for (auto i : Peer_List) {
+			cout << i.first << " [";
+			for (auto j : i.second) {
+				cout << j << ",";
+			}
+			cout << "]" << endl;
+		}
+		num_coordinated += (Peer_List.size() - 1);
+		cout << "..............." << endl;
+		cout << "...Pub List..." << endl;
+		cout << "[";
+		for (auto i : Pub_List) {
+			cout << i << ",";
+		}
+		cout << "]" << endl;
+		cout << "..............." << endl;
 
-    redisReply *reply;
-    redisReply *reply2;
+		//scheduler
+		cout << "++++++ into scheduler ++++++" << endl;
+		int sched_begin = 0, sched_end = 0;
+		sched_begin = gettime();//调度开始的时间
+		string propagate_string;
+		//先试一下不同步，直接取得resmap
+		scheduler(my_id, reply, contexts, propagate_string, Peer_List, Res_List, Load_List);
+		//至此完成了propagate string
+		sched_end = gettime();//调度结束的时间
+		sched_time = sched_end - sched_begin;
+		cout << "++++++ out scheduler ++++++" << endl;
 
-    //vector<int> &queue_map = osd->queue_map; //primitive gio
-    //使用disk_latency_map以及pending_list_size_map来计算出新的queuemap
-    /**先算(write*write/total+read)*disk***/
-    /*****/
-    //vector<float> queue_map(NUM_OSD);
-    dout(0)<<" mydebug: in gio"<<dendl;
-    int queue_map_size = 0;
-    osd->osd->schedule_lock.lock();
-    if(osd->cct->_conf->osd_gio_estimation==1){
-      for(auto it : osd->osd->pending_list_size_map){
-        int cur_osd = it.first;
-        int cur_size = it.second;
-        int write_size = osd->osd->pending_list_size_map_write[cur_osd];
-        //dout(0)<<" mydebug: write_size="<<write_size<<dendl;
-        int actual_disk_latency=0;//nsec
-        if(osd->cct->_conf->osd_gio_estimation_disk==0){
-          actual_disk_latency=osd->osd->disk_latency_map[cur_osd];
-        }else{
-          actual_disk_latency=osd->cct->_conf->osd_gio_estimation_disk;
-        }
-        float factor = ((float)((write_size*write_size/(write_size+cur_size+1)+cur_size)*actual_disk_latency))/1000000000;
-        //dout(0)<<" mydebug: factor="<<factor<<dendl;
-        //dout(0)<<" mydebug: disk latency="<<osd->osd->disk_latency_map[cur_osd]<<dendl;
-        queue_map[cur_osd] = osd->cct->_conf->osd_gio_estimation_factor*factor+((float)(actual_disk_latency))/1000000000;
-        queue_map_size++;
-      }
-    }else{
-      // for(auto it : osd->osd->pending_list_size_map){ //for last gio
-      //   int cur_osd = it.first;
-      //   int cur_size = it.second;
-      //   //int write_size = osd->osd->pending_list_size_map_write[cur_osd];
-      //   //dout(0)<<" mydebug: write_size="<<write_size<<dendl;
-      //   //dout(0)<<" mydebug: factor="<<factor<<dendl;
-      //   //dout(0)<<" mydebug: disk latency="<<osd->osd->disk_latency_map[cur_osd]<<dendl;
-      //   queue_map[cur_osd] = osd->osd->pending_list_size_map[cur_osd];
-      //   queue_map_size++;
-      // }
-      if(osd->gio_reset==1){ //latest gio
-        for(int i=0;i<NUM_OSD;i++){
-          osd->accumulate_queue_map[i] = 0;
-        }
-        osd->gio_reset=0;
-        dout(0)<<" mydebug: reset gio complete"<<dendl;
-      }
-      for(int i=0;i<NUM_OSD;i++){
-        //osd->accumulate_queue_map[i]=0;
-        queue_map[i] = osd->accumulate_queue_map[i];
-        queue_map_size++;
-      }
-    }
-    //根据pendinglist的情况决定time_interval的大小，
-    utime_t time_out_interval;
-		time_out_interval.tv.tv_sec = 0;
-    time_out_interval.tv.tv_nsec = osd->cct->_conf->osd_gio_wait_interval;
-    
+		//propagator
+		cout << "in propagator" << endl; //如果有新的，就对Send_List中所有的进行发送
+		if (Peer_List.size() != 0) {
+			for (auto i : Send_List) {
+				reply = (redisReply*)redisCommand(contexts[i], "rpushx %s %s", "res_queue", propagate_string.c_str());
+				cout << "sent to " << i << ", res=" << reply->integer << " " << propagate_string << endl;
+			}
+		}
+		propa_time = gettime() - sched_end;//发送所花费时间    
+		freeReplyObject(reply);//释放reply
+	}
 
-    osd->osd->schedule_lock.unlock();
-    if(queue_map_size<NUM_OSD){
-      dout(0)<<" mydebug: did not get complete queue_map"<<dendl;
-    }else{
-      for(int i=0;i<NUM_OSD;i++){
-        //dout(0)<<" queue_map["<<i<<"]="<<queue_map[i]<<dendl;
-      }
-    }
+	for (int i = 1; i <= NUM_OSD; i++) {//最后释放掉所有的context
+		redisFree(contexts[i]);
+	}
 
-    redisContext *context = osd->redis_context;
-    //translate to have2
-    //test mac env
-    int have2[EC_K+EC_M];
-    int have2_pos=0;
-    for (map<shard_id_t, pg_shard_t>::iterator i = shards.begin();
-      i != shards.end();
-      ++i)
-    {
-      have2[have2_pos]=i->second.osd;
-      //dout(0)<<" mydebug: have2["<<have2_pos<<"]="<<have2[have2_pos]<<dendl;
-      have2_pos++;
-    }
-    //start to handle
-    int schedule_map[NUM_OSD][EC_K+EC_M];//初始化schedulemp
-    for(int i=0;i<NUM_OSD;i++){
-      for(int j=0;j<(EC_K+EC_M);j++){
-        schedule_map[i][j]=-1;
-      }   
-    }
-    //把自己的map给加上
-    for(int i=0;i<(EC_K+EC_M);i++){
-        schedule_map[my_id%osd->cct->_conf->osd_gio_coordination_granularity][i]=have2[i];
-    }
-    reply = (redisReply *)redisCommand(context, "exists %s", info_key.c_str());
-    string info_str;
-    havetostr(info_str,have2);
-    //声明coor_times,先把自己的加上
-    map<int,string> coor_times;
-    //dout(0)<<" mydebug: infostr="<<info_str<<dendl;
-    if(reply->integer == 0){//如果不存在就创建info_key和num_key
-      //cout<<info_key<<" no exist!" <<endl;
-      dout(0)<<" mydebug: info no exist!"<<dendl;
-      // struct timeval tv;
-      // struct timezone tz;
-      // gettimeofday (&tv , &tz);
-      utime_t pub_time = ceph_clock_now();
-      //cout<<tv.tv_usec<<endl;
-      reply = (redisReply *)redisCommand(context, "set %s %s", info_key.c_str(),info_str.c_str());
-      //reply = (redisReply *)redisCommand(context, "set %s %d", num_key.c_str(),NUM_SCHEDULER-1);
-      reply = (redisReply *)redisCommand(context, "set %s %d", num_key.c_str(),0);
-      reply = (redisReply *)redisCommand(context, "set %s %d", time_key.c_str(),pub_time.usec());
-      reply = (redisReply *)redisCommand(context, "set %s %d", sec_key.c_str(),pub_time.sec());
-      //dout(0)<<"set sec_key ="<<pub_time.sec()<<dendl;
-      //dout(0)<<"set res = "<<reply->str<<dendl;//hhaa
-      //reply = (redisReply *)redisCommand(context, "get %s", sec_key.c_str());
-      //dout(0)<<"get sec_key ="<<stoi(string(reply->str))<<dendl;
-      coor_times[my_id] = to_string(pub_time.sec())+to_string(pub_time.usec());
-      dout(0)<<"set coor_times of myid:"<<coor_times[my_id]<<dendl;
-    }else{
-      //dout(0)<<" mydebug: info exist!"<<dendl;
-			utime_t start_time = ceph_clock_now();
-      int first_check=1; 
-      while(1){ //如果存在就等待拿的是不是差不多了
-        reply = (redisReply *)redisCommand(context, "get %s", num_key.c_str());
-        if(stoi(string(reply->str)) >= (osd->cct->_conf->osd_gio_coordination_granularity-1)){
-          //当全部取完时，可以退出
-          //cout<<info_key<<" has been consumed, start next!"<<endl;
-          if(first_check){
-            //dout(0)<<"consumed first_check"<<dendl;
-          }else{
-            //dout(0)<<"consumed other_check"<<dendl;
-            //dout(0)<<info_key<<" pub wait for  "<<ceph_clock_now()-start_time<<dendl;
-          }
-          //dout(0)<<" mydebug:coor_info#"<<stoi(string(reply->str))<<"#"<<dendl;
-          break;
-        }
-        first_check=0;       
-        utime_t cur_time = ceph_clock_now();
-        if((cur_time-start_time)>time_out_interval){
-          //cout<<info_key<<" time_out, start next!"<<endl;
-          //dout(0)<<info_key<<" time_out, start next!, consumed by "<<stoi(string(reply->str))<<dendl;
-          //dout(0)<<" mydebug:coor_info#"<<stoi(string(reply->str))<<"#"<<dendl;
-          break;
-        }
-      }
-            
-      // struct timeval tv;
-      // struct timezone tz;
-      // gettimeofday (&tv , &tz);
-      utime_t pub_time = ceph_clock_now();
-      //cout<<"new time_stamp"<<tv.tv_sec<<"."<<tv.tv_usec<<endl;
-      utime_t start_set = ceph_clock_now();
-      reply = (redisReply *)redisCommand(context, "set %s %s", info_key.c_str(),info_str.c_str());
-      //reply = (redisReply *)redisCommand(context, "set %s %d", num_key.c_str(),NUM_SCHEDULER-1);
-      reply = (redisReply *)redisCommand(context, "set %s %d", num_key.c_str(),0);
-      reply = (redisReply *)redisCommand(context, "set %s %d", time_key.c_str(),pub_time.usec());
-      reply = (redisReply *)redisCommand(context, "set %s %d", sec_key.c_str(),pub_time.sec());
-      //dout(0)<<"redis_info#set_latency,"<<(ceph_clock_now()-start_set)/4*1000000<<"#"<<dendl;
-      //dout(0)<<"set sec_key ="<<pub_time.sec()<<dendl;
-      //dout(0)<<"set res = "<<reply->str<<dendl;//hhaa
-      reply = (redisReply *)redisCommand(context, "get %s", sec_key.c_str());
-      //dout(0)<<"get sec_key ="<<stoi(string(reply->str))<<dendl;
-      coor_times[my_id] = to_string(pub_time.sec())+to_string(pub_time.usec());
-      //dout(0)<<"set coor_times of myid:"<<coor_times[my_id]<<dendl;
-    }
-    
-    utime_t start_rpush = ceph_clock_now();
-    //reply = (redisReply *)redisCommand(context, "RPUSH testlist testtest");
-    dout(0)<<"redis_info#rpush_latency,"<<(ceph_clock_now()-start_rpush)*1000000<<"#"<<dendl;
-    utime_t start_lpop = ceph_clock_now();
-    reply = (redisReply *)redisCommand(context, "LPOP testlist ");
-    dout(0)<<"redis_info#lpop_latency,"<<(ceph_clock_now()-start_lpop)*1000000<<"#"<<dendl;
-    //开始获取别的osd的obj
-    int num_got = 0;
-    //循环遍历其他osd
-    int i=0;//i为当前遍历的osd编号在当前region的偏移
-    vector<int> have_got(osd->cct->_conf->osd_gio_coordination_granularity,0);
-    for(int j=0;j<osd->cct->_conf->osd_gio_coordination_granularity;j++){
-      have_got[j]=0;
-    }
-    ////hahahaha
-		utime_t start_time = ceph_clock_now();
-    //cout<<"start_time="<<start_time<<endl;
-    int region_id = my_id / osd->cct->_conf->osd_gio_coordination_granularity;
-    
-
-    while(1){
-      if(i==(my_id%osd->cct->_conf->osd_gio_coordination_granularity) || have_got[i]){//跳过自己id的偏移以及已经获得的id
-        //dout(0)<<"skip "<<i<<"!"<<dendl;
-        i++;
-        i%=osd->cct->_conf->osd_gio_coordination_granularity;
-        continue;
-      }
-      int actual_id=i+region_id*osd->cct->_conf->osd_gio_coordination_granularity;
-      //dout(0)<<"check "<<actual_id<<"..."<<dendl;
-      string target_key = string("info")+to_string(actual_id);
-      string target_num = string("num")+to_string(actual_id);
-      string target_time = string("time")+to_string(actual_id);
-      string target_sec = string("sec")+to_string(actual_id);
-      //cout<<"target_key="<<target_key<<endl;
-      utime_t start_exist = ceph_clock_now();
-      reply = (redisReply *)redisCommand(context, "exists %s", target_time.c_str());
-      reply2 = (redisReply *)redisCommand(context, "exists %s", target_sec.c_str());
-      //dout(0)<<"redis_info#exist_latency,"<<(ceph_clock_now()-start_exist)/2*1000000<<"#"<<dendl;
-      if(reply->integer == 0 || reply2->integer ==0){//如果target_time不存在就跳到后面判断是否结束
-        dout(0)<<target_time<<" no exists!"<<dendl;
-        goto end;
-      }else{
-        //cout<<target_time<<" exists!"<<endl;
-        //time存在了就获得time
-        reply = (redisReply *)redisCommand(context, "get %s", target_time.c_str());      
-        string temp_time = reply->str;
-        if(temp_time==osd->last_time[actual_id]){//如果还是之前的时间戳，就继续看下一个
-          goto end;
-        }
-        reply = (redisReply *)redisCommand(context, "get %s", target_sec.c_str());      
-        string sec_time = reply->str;
-        if((start_time.sec()-stoi(sec_time))>3){//如果时间戳太旧了，就下一个
-          //dout(0)<<"start_time.sec()="<<start_time.sec()<<", sec_time="<<stoi(sec_time)<<", deviation="<<start_time.sec()-stoi(sec_time)<<dendl;
-          //dout(0)<<target_key<<" is too old"<<dendl;
-          goto end;
-        }
-        //如果obj信息合适
-        //cout<<"get proper "<<target_key<<endl;
-        //dout(0)<<"get proper "<<target_key<<dendl;
-        osd->last_time[actual_id] = temp_time;
-        utime_t start_get = ceph_clock_now();
-        reply = (redisReply *)redisCommand(context, "get %s", target_key.c_str());
-        //dout(0)<<"redis_info#get_latency,"<<(ceph_clock_now()-start_get)*1000000<<"#"<<dendl;
-        //cout<<reply->type<<endl;
-        int temp_have[EC_K+EC_M];
-        if(reply->str==NULL){
-          //cout<<target_key<<" has beed deleted!"<<endl;
-        }
-        string temp_str = reply->str;
-
-        //将目标obj的引用次数加一
-        //reply = (redisReply *)redisCommand(context, "decr %s", target_num.c_str());
-        utime_t start_incr = ceph_clock_now();
-        reply = (redisReply *)redisCommand(context, "incr %s", target_num.c_str());
-        //dout(0)<<"redis_info#incr_latency,"<<(ceph_clock_now()-start_incr)*1000000<<"#"<<dendl;
-        strtohave(temp_str,temp_have);//读出的信息存放在temp_have中，
-        // for(int i=0;i<(EC_K+EC_M);i++){
-        //     cout<<"strtohave:"<<temp_have[i]<<endl;
-        // }
-        //将have插入到schedule_map中
-        for(int j=0;j<(EC_K+EC_M);j++){
-          schedule_map[i][j] = temp_have[j];
-        }
-        //将需要协调的对象的时间给保存下来
-        coor_times[actual_id] = sec_time+temp_time;
-        //获得的加1
-        num_got++;
-        have_got[i]=1;
-      }
-    end:            
-      if(num_got>=(osd->cct->_conf->osd_gio_coordination_granularity-1)){//首先保证至少获得这么多 
-        //dout(0)<<"have got all: "<<osd->cct->_conf->osd_gio_coordination_granularity-1<<dendl;
-        //dout(0)<<"gather wait for"<<ceph_clock_now()-start_time<<dendl;
-        //dout(0)<<" mydebug:coor_info#"<<num_got<<"#"<<dendl;
-        break;
-        //如果全部拿到了，就退出                   
-      }
-      utime_t cur_time = ceph_clock_now();
-      if((cur_time-start_time)>time_out_interval){//如果实在等不到了，也推出
-        //dout(0)<<"dont wait anymore, have got "<<num_got<<dendl;
-        //dout(0)<<" mydebug:coor_info#"<<num_got<<"#"<<dendl;
-        break;
-      }
-      i++;
-      i%=osd->cct->_conf->osd_gio_coordination_granularity;
-    }
-    //已经获得到了schedule map，进行调度
-    osd->osd->schedule_lock.lock();
-    for(int i =0;i<osd->cct->_conf->osd_gio_coordination_granularity;i++){
-      if(schedule_map[i][0]==-1){
-        continue;//跳过没有收到信息的osd
-      }
-      //先查看是否已经存在这个结果了
-      string coor_res = to_string(i)+coor_times[i];
-      reply = (redisReply *)redisCommand(context, "exists %s", coor_res.c_str());
-      int processed = 0;
-      string res_string;
-      if(reply->integer == 0){//如果不存在，就正常操作
-        dout(0)<<i<<" not processed!"<<dendl;
-      }else{ //如果存在，就把他取出来
-        reply2 = (redisReply *)redisCommand(context, "get %s", coor_res.c_str());
-        processed=1; //need change to 1
-        res_string = reply2->str;
-        dout(0)<<i<<" processed! res="<<res_string<<dendl;
-      }
-      
-      if(processed==0){//如果还没被处理过
-      //调度就是选最少的四个
-        vector<pair<int,float>> load_of_shard;
-        for(int j=0;j<(EC_K+EC_M);j++){
-          load_of_shard.push_back(make_pair(schedule_map[i][j], queue_map[schedule_map[i][j]]));
-        }
-        sort(load_of_shard.begin(),load_of_shard.end(),mycmp2);
-        res_string="";
-        for(int j=0;j<EC_K;j++){//调度最小的k个
-            //queue_map[load_of_shard[j].first]++;//for primitive gio
-            //osd->osd->pending_list_size_map[load_of_shard[j].first]++;//for last gio
-            osd->accumulate_queue_map[load_of_shard[j].first]++; //latest gio
-            res_string+=to_string(load_of_shard[j].first);
-        }
-        //更新redis中的值，使用setnx保证唯一
-        dout(0)<<i<<" after schedule, res="<<res_string<<dendl;
-        utime_t start_setnx = ceph_clock_now();
-        reply = (redisReply *)redisCommand(context, "setnx %s %s", coor_res.c_str(),res_string.c_str());
-        //dout(0)<<"redis_info#setnx_latency,"<<(ceph_clock_now()-start_setnx)*1000000<<"#"<<dendl;
-        //dout(0)<<i<<" replyres: "<<reply->type<<" "<<reply->integer<<dendl;
-        if(reply->integer==0){
-          dout(0)<<i<<" conflict!"<<dendl;
-        }else{
-          //dout(0)<<i<<" set res success!"<<dendl;
-        }
-        //更新queue_map
-        if(osd->cct->_conf->osd_gio_estimation==1){
-          for(auto it : osd->osd->pending_list_size_map){
-            int cur_osd = it.first;
-            int cur_size = it.second;
-            int write_size = osd->osd->pending_list_size_map_write[cur_osd];
-            //dout(0)<<" mydebug: write_size="<<write_size<<dendl;
-            int actual_disk_latency=0;//nsec
-            if(osd->cct->_conf->osd_gio_estimation_disk==0){
-              actual_disk_latency=osd->osd->disk_latency_map[cur_osd];
-            }else{
-              actual_disk_latency=osd->cct->_conf->osd_gio_estimation_disk;
-            }
-            float factor = ((float)((write_size*write_size/(write_size+cur_size+1)+cur_size)*actual_disk_latency))/1000000000;
-            //dout(0)<<" mydebug: factor="<<factor<<dendl;
-            //dout(0)<<" mydebug: disk latency="<<osd->osd->disk_latency_map[cur_osd]<<dendl;
-            queue_map[cur_osd] = osd->cct->_conf->osd_gio_estimation_factor*factor+((float)(actual_disk_latency))/1000000000;
-            //queue_map_size++;
-          }
-        }else{
-          // for(auto it : osd->osd->pending_list_size_map){ //for last gio
-          //   int cur_osd = it.first;
-          //   int cur_size = it.second;
-          //   //int write_size = osd->osd->pending_list_size_map_write[cur_osd];
-          //   //dout(0)<<" mydebug: write_size="<<write_size<<dendl;
-          //   //dout(0)<<" mydebug: factor="<<factor<<dendl;
-          //   //dout(0)<<" mydebug: disk latency="<<osd->osd->disk_latency_map[cur_osd]<<dendl;
-          //   queue_map[cur_osd] = osd->osd->pending_list_size_map[cur_osd];
-          //   //queue_map_size++;
-          // }
-          // for(int i=0;i<NUM_OSD;i++){ // for latest gio
-          //   queue_map[i] = osd->accumulate_queue_map[i];
-          //   dout(0)<<"mydebug:queue_info#"<<osd->accumulate_queue_map[i]<<"#"<<dendl;
-          // }
-        }
-        if(i==(my_id%osd->cct->_conf->osd_gio_coordination_granularity)){//根据调度把自己的have给去了
-          //需要定时删除掉自己之前的调度结果,如果是自己的话，就把当前的coor_res给放到队列里面去
-          osd->trash_queue.push(coor_res);
-          if(osd->trash_queue.size()>20){
-            string to_delete = osd->trash_queue.front();
-            osd->trash_queue.pop();
-            utime_t start_del = ceph_clock_now();
-            reply = (redisReply *)redisCommand(context, "del %s", to_delete.c_str());
-            //dout(0)<<"redis_info#del_latency,"<<(ceph_clock_now()-start_del)*1000000<<"#"<<dendl;
-          }
-          //
-          for(int j=EC_K;j<(EC_K+EC_M);j++){
-            int temp_osd_id = load_of_shard[j].first;//不应该读这个osd
-            int k;//相应osd所对应的shardid
-            for(k=0;k<(EC_K+EC_M);k++){
-              if(have2[k]==temp_osd_id){
-                break;
-              }
-            }
-            have.erase(k);
-            //dout(0)<<"have.erase "<<k<<dendl;
-          }
-        }
-      }else{//processed==1,如果之前有结果，就直接使用之前的结果，当节点数量上升时需要改变resstring的定义
-        dout(0)<<i<<" res_string= "<<res_string<<dendl;
-        vector<int> temp_res_vec;
-        for(int j=0;j<EC_K;j++){
-          int temp_int = res_string[j]-'0'; //todo
-          temp_res_vec.push_back(temp_int);
-          //queue_map[temp_int]++; //for pritimitive gio
-          //更新queuemap
-          osd->accumulate_queue_map[temp_int]++; //for latest gio
-          for(int i=0;i<NUM_OSD;i++){ //for latest gio
-            queue_map[i] = osd->accumulate_queue_map[i];
-            //dout(0)<<"mydebug:queue_info#"<<osd->accumulate_queue_map[i]<<"#"<<dendl;
-          }
-        }
-
-        if(i==(my_id%osd->cct->_conf->osd_gio_coordination_granularity)){//根据调度把自己的have给去了
-          //需要定时删除掉自己之前的调度结果,如果是自己的话，就把当前的coor_res给放到队列里面去
-          osd->trash_queue.push(coor_res);
-          if(osd->trash_queue.size()>20){
-            string to_delete = osd->trash_queue.front();
-            osd->trash_queue.pop();
-            reply = (redisReply *)redisCommand(context, "del %s", to_delete.c_str());
-          }
-          //
-          for(int j=0;j<(EC_K+EC_M);j++){
-            int find=0;
-            for(int k=0;k<EC_K;k++){
-              if(temp_res_vec[k]==have2[j]){
-                find=1;
-                break;
-              }
-            }
-            if(find==0){
-               have.erase(j);
-               dout(0)<<"have.erase "<<j<<dendl;
-            }             
-          }
-        }
-      }
-    }
-    int queue_sum=0;
-    for(int i=0;i<NUM_OSD;i++){
-      queue_sum+=osd->accumulate_queue_map[i];
-      dout(0)<<"mydebug:queue_info#"<<queue_sum<<"#"<<dendl;
-    }
-    //dout(0)<<" mydebug:after_schedule:"<<queue_map<<dendl;
-    osd->osd->schedule_lock.unlock();
-
-  }else{
-    ;
-  }
-  /****k-optimal***/
-
-
-
-
+	cout << "num_coordinated = " << num_coordinated * 2 << endl;
+	cout << "average schedule = " << ((float)sched_time) / NUM_OBJ << endl;
+	cout << "average propagate= " << ((float)propa_time) / NUM_OBJ << endl;
+  //??? 还差最后一步have
   set<int> need;
   int r = ec_impl->minimum_to_decode(want, have, &need);
   if (r < 0)
     return r;
 
-  
   if (do_redundant_reads) {
       need.swap(have);
   } 
 
+
   if (!to_read)
     return 0;
-
-  //dout(0) << ": mydebug: schedule_info#need,"<<need<<"#"<< dendl;
-  //dout(0) << ": mydebug: schedule_info#do_redundant_reads,"<<do_redundant_reads<<"#"<< dendl;
 
   for (set<int>::iterator i = need.begin();
        i != need.end();
@@ -2207,14 +1711,6 @@ int ECBackend::get_min_avail_to_read_shards(
     assert(shards.count(shard_id_t(*i)));
     to_read->insert(shards[shard_id_t(*i)]);
   }
-  
-  for(set<pg_shard_t>::iterator i = to_read->begin();i!=to_read->end();i++){
-    after_str+=to_string(i->osd);
-    //dout(0)<<":sub_info#estimated,"<< hoid.oid.name<<","<<i->osd<<","<<queue_map[i->osd]<<"#"<<dendl;
-  }
-
-  //dout(0) << ": mydebug: schedule_info#after,"<< hoid.oid.name << "," <<after_str<<","<<ceph_clock_now()<<"#"<< dendl;
-
   return 0;
 }
 
@@ -2261,6 +1757,248 @@ int ECBackend::get_remaining_shards(
   }
   return 0;
 }
+
+//hekang
+void ECBackend::havetostr(string& res, vector<int>& have)
+{
+	int size = have.size();
+	for (int i = 0; i < size; i++) {
+		if (i != (size - 1)) {
+			string temp = to_string(have[i]) + string(",");
+			res += temp;
+		}
+		else {
+			string temp = to_string(have[i]);
+			res += temp;
+		}
+	}
+	cout << "have to str:" << res << endl;
+}
+
+void ECBackend::strtohave(string& res, vector<int>& have)
+{
+	int pos = res.find(",");
+	int pre_pos = 0;
+	int i = 0;
+	while (i < (K + M)) {
+		have.push_back(stoi(res.substr(pre_pos, (pos - pre_pos))));
+		i++;
+		pre_pos = pos + 1;
+		pos = res.find(",", pre_pos);
+	}
+}
+
+void ECBackend::update_Load_List(vector<int>& Load_List, string& Load_List_string) {
+	int pos = Load_List_string.find(",");
+	int pre_pos = 0;
+	int i = 0;
+	while (i < SIZE_POOL) {
+		Load_List[i] = stoi(Load_List_string.substr(pre_pos, (pos - pre_pos)));
+		i++;
+		pre_pos = pos + 1;
+		pos = Load_List_string.find(",", pre_pos);
+	}
+}
+
+void ECBackend::strtohave_res(string& res, vector<int>& have)
+{
+	int pos = res.find(",");
+	int pre_pos = 0;
+	int i = 0;
+	while (i < K) {
+		have.push_back(stoi(res.substr(pre_pos, (pos - pre_pos))));
+		i++;
+		pre_pos = pos + 1;
+		pos = res.find(",", pre_pos);
+	}
+}
+
+bool ECBackend::mycmp(pair<int, int> a, pair<int, int> b) {
+	return a.second < b.second; //升序排列，延迟小的osd放前面
+}
+
+//计算当前时间
+int ECBackend::gettime() {
+	struct timeval tv;
+	struct timezone tz;
+	gettimeofday(&tv, &tz);//tv和tz作为版本号
+	return tv.tv_sec * 1000000 + tv.tv_usec;
+}
+//获取数据中的第一个字符串
+string ECBackend::getstring(string& input) {
+	string result;
+	for (; input.size() > 0;) {
+		if (input[0] == ' ') {
+			input.erase(0, 1);
+			break;
+		}
+		else {
+			result += input[0];
+			input.erase(0, 1);
+		}
+	}
+	return result;
+}
+
+//每个object进行publish,对其他的redisserver上的comm_queue做rpush操作
+void ECBackend::publish(int my_id,
+	redisReply& reply,
+	vector<redisContext*>& contexts,
+	vector<int>& Pub_List,
+	string Win_Info) {
+	//将自己的comm_queue公开,用rpush，创建队列
+	reply = (redisReply*)redisCommand(contexts[my_id], "rpush %s %s", "comm_queue", "comm_head");
+	cout << "create comm_queue, num=:" << reply->integer << endl;
+	//将自己的res_queue公开,用rpush，创建队列
+	reply = (redisReply*)redisCommand(contexts[my_id], "rpush %s %s", "res_queue", "res_head");
+	cout << "create res_queue, num=:" << reply->integer << endl;
+	for (int i = 1; i <= NUM_OSD; i++) {//开始publish
+		if (i == my_id)
+			continue;//跳过自己
+		//用rpushx，对已存在的队列进行插入
+		reply = (redisReply*)redisCommand(contexts[i], "rpushx %s %s", "comm_queue", Win_Info.c_str());
+		cout << "push to " << to_string(i) << ", res=" << reply->integer << endl;
+		if (reply->integer > 0) {
+			Pub_List.push_back(i);//将pub成功的值加入Pub_List
+		}
+	}
+	return;
+}
+
+//subscribe:对自己的redisserver上的comm_queue做lpop操作
+//成功sub返回true,否则返回false
+bool ECBackend::sub_once(int my_id,
+	redisReply& reply,
+	vector<redisContext*>& contexts,
+	string queuename,
+	map<int, vector<int>>& Peer_List,
+	vector<int>& Send_List)
+{
+	//为了防止head被pop出来，只有在队列大小大于等于2的时候才rpop
+	reply = (redisReply*)redisCommand(contexts[my_id], "llen %s", queuename.c_str());
+	if (reply->integer >= 2) {
+		cout << "able to rpop" << endl;
+		reply = (redisReply*)redisCommand(contexts[my_id], "rpop %s", queuename.c_str());
+		if (reply->str != NULL) {
+			cout << "sub from, res=" << reply->str << endl;//添加进Peer_List
+			int id = 0;
+			vector<int> temp_have;
+			id = stoi(getstring(reply->str));
+			string havestring = getstring(reply->str);
+			strtohave(havestring,temp_have);
+			Peer_List[id] = temp_have;
+			Send_List.push_back(id);
+			return true;
+		}
+	}
+	return false;
+}
+void ECBackend::scheduler(int my_id,
+	redisReply& reply,
+	vector<redisContext*>& contexts,
+	string& propagate_string,
+	map<int, vector<int>>& Peer_List,
+	map<int, vector<int>>& Res_List,
+	vector<int> &Load_List)
+{
+	//先试一下不同步，直接取得resmap
+	reply = (redisReply*)redisCommand(contexts[my_id], "rename %s %s", "res_queue", "res_queue2");//更改comm_queue名称，使其他OSD无法访问
+	reply = (redisReply*)redisCommand(contexts[my_id], "llen %s", "res_queue2");
+	if (reply->integer == 1) {//说明里面只有一个head了，可以把comm_queue2删除
+		reply = (redisReply*)redisCommand(contexts[my_id], "del %s", "res_queue2");
+	}
+	else if (reply->integer > 1) {//说明里面还有新的
+		int left_num = reply->integer - 1;
+		int res_id = 0, res_time = 0, oldest_time = INT_MAX;
+		vector<int> oldest_index;
+		vector<string> res_strings;
+		for (int i = 0; i < left_num; i++)//先把里面的所有结果取出来
+		{
+			reply = (redisReply*)redisCommand(contexts[my_id], "rpop %s", "res_queue2");
+			if (reply->str != NULL) {
+				res_strings.push_back(string(reply->str));
+				res_id = stoi(getstring(reply->str));
+				res_time = stoi(getstring(reply->str));
+				if (res_time < oldest_time) {
+					oldest_time = res_time;
+					oldest_index.clear();
+					oldest_index.push_back(i);//用来记录最老版本的resstring的下标
+					//unconflict = 0;
+				}
+				else if (res_time = oldest_time) {
+					//unconflict++; //记录和最老版本的resstring时间相同的次数
+					oldest_index.push_back(i);
+				}
+			}
+		}
+		cout << "get " << res_strings.size() << " results" << endl;
+		reply = (redisReply*)redisCommand(contexts[my_id], "del %s", "res_queue2");//把comm_queue2删除
+		//标准格式为：ID+time.sec+time.usec+num_res+id_res+1,2,3,4+...+id_res+1,2,3,4+Load_List
+		cout << "find oldest version = " << oldest_time << endl;
+		if (oldest_index.size()) {
+			int index = oldest_index[0];//取最早时间戳的第一个
+			cout << "res is ok :" << res_strings[index] << endl;
+			getstring(res_strings[index]);//去掉ID
+			getstring(res_strings[index]);//去掉时间
+			int num_res = stoi(getstring(res_strings[index]));//包含的res数量
+			int id_res;
+			for (int i = 0; i < num_res; i++) {
+				id_res = stoi(getstring(res_strings[index]));
+				cout << "-----id_res =" << id_res << endl;
+				string layout_string = getstring(res_strings[index]);
+				cout << "-----layout_string =" << layout_string << endl;
+				vector<int> temp_have;
+				strtohave_res(layout_string, temp_have);
+				cout << "-----temp_have =" << layout_string << endl;
+				//需要判断可以添加，条件为：如果不存在就添加
+				if (Res_List.find(id_res) == Res_List.end()) {
+					Res_List[id_res] = temp_have;
+					cout << "-----finish add res" << endl;
+					//添加res的同时，要把peerlist中重复的删掉
+					if (Peer_List.find(id_res) != Peer_List.end()) {//peerlist中存在重复的
+						Peer_List.erase(Peer_List.find(id_res));
+						cout << "-----finish delete from Peer List" << endl;
+					}
+				}
+			}
+			string Load_List_string = getstring(res_strings[index]);
+			update_Load_List(Load_List, Load_List_string);//更新load list
+			cout << "-----finish update local list" << Load_List_string << endl;
+		}
+	}
+	cout << "------ got Res_List ------" << endl;//到这一步就搞好Res_list和PeerList了，然后只需要对PeerList进行调度即可
+	//标准格式为：ID time id_res 1,2,3,4 ... id_res 1,2,3,4 Load_List
+	propagate_string = to_string(my_id) + " " + to_string(ceph_clock_now()) +  " " + to_string(Peer_List.size());
+	for (auto i : Peer_List) {//对于每个Peer
+		vector<pair<int, int>> load_of_shard;
+		vector<int>& temp_layout = i.second;
+		for (int j = 0; j < (K + M); j++) {
+			load_of_shard.push_back(make_pair(temp_layout[j], Load_List[temp_layout[j]]));
+		}
+		sort(load_of_shard.begin(), load_of_shard.end(), mycmp);
+		propagate_string += " ";
+		propagate_string += to_string(i.first);
+		propagate_string += " ";
+		for (int j = 0; j < K; j++) {//调度最小的k个
+			Load_List[load_of_shard[j].first]++; //更新Local_List
+			propagate_string += to_string(load_of_shard[j].first);
+			if (j != (K - 1)) {
+				propagate_string += ",";
+			}
+		}
+		cout << "finish schedule" << i.first << endl;
+	}
+	//添加Local_List
+	propagate_string += " ";
+	for (int i = 0; i < SIZE_POOL; i++) {
+		propagate_string += to_string(Load_List[i]);
+		if (i != (SIZE_POOL - 1)) {
+			propagate_string += ",";
+		}
+	}
+}
+
+//hekang
 
 void ECBackend::start_read_op(
   int priority,
@@ -2352,7 +2090,6 @@ void ECBackend::do_read_op(ReadOp &op)
       msg->trace.init("ec sub read", nullptr, &op.trace);
       msg->trace.keyval("shard", i->first.shard.id);
     }
-    msg->op.send_time = ceph_clock_now();
     get_parent()->send_message_osd_cluster(
       i->first.osd,
       msg,
@@ -2971,7 +2708,6 @@ void ECBackend::objects_read_and_reconstruct(
     obj_want_to_read.insert(make_pair(to_read.first, want_to_read));
   }
 
-  //dout(0)<<" :obj_start#"<<reads.begin()->first.oid.name<<","<<ceph_clock_now()<<","<<osd->whoami<<"#"<<dendl;
   start_read_op(
     CEPH_MSG_PRIO_DEFAULT,
     obj_want_to_read,
